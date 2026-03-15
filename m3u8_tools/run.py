@@ -34,11 +34,11 @@ _counter_lock = threading.Lock()
 
 # 修复：正确定义请求头（3.0.2版本用|分隔多个header）
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
-# REFERER = "https://missav.ai/"
-# ORIGIN = "https://missav.ai"
+REFERER = "https://missav.ai/"
+ORIGIN = "https://missav.ai"
 
-REFERER = "https://www.xvideos.com/"
-ORIGIN = "https://www.xvideos.com"
+# REFERER = "https://www.xvideos.com/"
+# ORIGIN = "https://www.xvideos.com"
 
 REQUEST_HEADERS = f"User-Agent: {USER_AGENT}|Referer: {REFERER}|Origin: {ORIGIN}"
 PROXY_ADDR="http://127.0.0.1:7890"
@@ -99,7 +99,7 @@ class Config:
     cli_chunk_size: str = "1M"  # 分片大小
     min_file_size: int = 1024 * 1024  # 最小有效文件大小（1MB）
     download_retry_times: int = 1 # 下载失败重试次数
-    concurrent_fragments: int = "16" # 下载失败重试次数
+    concurrent_fragments: int = "32"
 
 
 # ===================== 信号类（线程安全通信） =====================
@@ -544,29 +544,27 @@ class DownloadWorker(QThread):
             os.remove(part_file)
             print(f"✅ 清理残留文件：{part_file}")
 
+
+
         cmd = [
             "yt-dlp",
-            # 强制指定ffmpeg路径（解决yt-dlp找不到的问题）
-            "--ffmpeg-location", ffmpeg_path,
-            # 自定义路径+安全文件名（无中文/特殊字符）
+            "--ffmpeg-location",ffmpeg_path,
             "-o", save_path,
-            # 强制转MP4 + 删除源文件
-            "--recode-video", "mp4",
-            "--no-keep-video",
-            "--merge-output-format", "mp4",
-            # 关键：添加反爬请求头
             "--user-agent", USER_AGENT,
             "--add-header", f"Referer:{REFERER}",
-            # 禁用aria2c（避免警告，用默认下载器+ffmpeg处理加密）
             "--hls-prefer-ffmpeg",
-            # 禁用分片下载（避免surrit.com风控）
             "--hls-use-mpegts",
-            "--concurrent-fragments", self.config.concurrent_fragments,
-            "--no-check-certificate",  # 忽略SSL证书错误（部分网站需要）
-            # 目标m3u8链接
+            "--concurrent-fragments",  self.config.concurrent_fragments,
+            "--no-check-certificate",
+            "--retries", "5",
+            "--fragment-retries", "1",
+            "--socket-timeout", "300",
+            "--continue",
+            "--no-part",
+            "--no-overwrites",
+            "--ignore-errors",
             m3u8_url
         ]
-
 
         try:
             self.signals.log.emit(f"执行CLI命令：{' '.join(cmd)}", "DEBUG")
@@ -663,7 +661,7 @@ class M3U8Downloader(QMainWindow):
 
         advanced_layout.addWidget(QLabel("下载并发数："))
         self.worker_spin = QSpinBox()
-        self.worker_spin.setRange(1, 4)
+        self.worker_spin.setRange(1, 8)
         self.worker_spin.setValue(self.config.max_download_workers)
         self.worker_spin.valueChanged.connect(lambda v: setattr(self.config, 'max_download_workers', v))
         advanced_layout.addWidget(self.worker_spin)
