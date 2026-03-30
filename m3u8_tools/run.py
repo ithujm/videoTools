@@ -20,17 +20,20 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QObject, QMutex, QMute
 from PyQt5.QtGui import QFont, QColor
 import subprocess
 
-
 import time
 import hashlib
 import threading
 from typing import Optional
 
+import re
+import time
+import urllib.parse
+from typing import Optional
+from playwright.sync_api import sync_playwright
+
 # 线程安全计数器+锁（保证多线程下编码唯一）
 _code_counter = 0
 _counter_lock = threading.Lock()
-
-
 
 # 修复：正确定义请求头（3.0.2版本用|分隔多个header）
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
@@ -41,12 +44,7 @@ ORIGIN = "https://missav.ai"
 # ORIGIN = "https://www.xvideos.com"
 
 REQUEST_HEADERS = f"User-Agent: {USER_AGENT}|Referer: {REFERER}|Origin: {ORIGIN}"
-PROXY_ADDR="http://127.0.0.1:7890"
-
-
-
-
-
+PROXY_ADDR = "http://127.0.0.1:7890"
 
 
 def extract_video_code(title: str) -> str:
@@ -83,6 +81,7 @@ def extract_video_code(title: str) -> str:
     # 最终生成：MD5前缀_时间戳_计数器（既关联标题，又保证多线程唯一）
     return f"video_{title_md5}_{timestamp}_{counter:03d}"
 
+
 # ===================== 全局配置（缓存+导出版） =====================
 class Config:
     # 基础配置
@@ -98,7 +97,7 @@ class Config:
     cli_retry: int = 5  # CLI重试次数
     cli_chunk_size: str = "1M"  # 分片大小
     min_file_size: int = 1024 * 1024  # 最小有效文件大小（1MB）
-    download_retry_times: int = 1 # 下载失败重试次数
+    download_retry_times: int = 1  # 下载失败重试次数
     concurrent_fragments: int = "32"
 
 
@@ -290,91 +289,95 @@ class CaptureWorker(QThread):
             "INFO")
         self.signals.capture_done.emit(m3u8_results)
 
-
     def capture_single_task(self, url: str, title: str) -> Optional[str]:
         # 1. 初始化：收集所有匹配的m3u8链接（替代原有单个m3u8_link）
-        m3u8_links = []
+        m3u8_list = []
 
-        def _extract_quality(quality_str: str) -> int:
-            """内部函数：将清晰度关键词量化为数字（便于对比）"""
-            quality_str = quality_str.lower()
-            if quality_str == "0p":
-                return 0  # 0p设为最低清晰度
-            elif quality_str == "video":
-                return 2160  # video默认视为4K（2160p），可根据实际场景调整
-            elif re.match(r"\d+p", quality_str):
-                # 提取xxp中的数字（如360p→360，1080p→1080）
-                return int(quality_str.replace("p", ""))
-            return -1  # 无效清晰度（兜底）
-
-        def _get_highest_quality_url(url_list: list) -> Optional[str]:
-            """内部函数：从链接列表中筛选清晰度最高的m3u8链接"""
-            if not url_list:
-                return None
-
-            quality_url_map = {}
-            # 正则：匹配所有包含 0p/video/数字+p 的m3u8链接（兼容任意位置的清晰度）
-            quality_pattern = r"(0p|video|\d+p)"
-
-            for res_url in url_list:
-                match = re.search(quality_pattern, res_url, re.IGNORECASE)
-                if not match:
-                    continue
-                # 提取清晰度关键词并量化
-                quality_key = match.group(1)
-                quality_num = _extract_quality(quality_key)
-                # 去重：同清晰度保留第一个匹配的链接
-                if quality_num not in quality_url_map:
-                    quality_url_map[quality_num] = res_url
-
-            # 选出清晰度最高的链接
-            if quality_url_map:
-                max_quality = max(quality_url_map.keys())
-                return quality_url_map[max_quality]
-            return None
+        # ===================== 核心规则：优先 video.m3u8，其次最大清晰度 =====================
+        def get_link_score(link):
+            if "video.m3u8" in link:
+                return 9999  # 最高优先级
+            match = re.search(r"(\d+)[pP]", link)
+            return int(match.group(1)) if match else 0
 
         try:
-            from playwright.sync_api import sync_playwright
             with sync_playwright() as p:
                 browser = p.chromium.launch(
-                    headless=True,
-                    args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"]
+                    headless=False,
+                    args=[
+                        "--no-sandbox",
+                        "--disable-web-security",
+                        "--ignore-certificate-errors",
+                        "--disable-features=IsolateOrigins",
+                        "--disable-site-isolation-trials"
+                    ]
                 )
+
                 context = browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+                    viewport={"width": 1920, "height": 1080},
+                    locale="zh-CN"
                 )
+
                 page = context.new_page()
 
+                # ===================== 关键修复：获取 完整原始 URL（不会截断、不会丢参数） =====================
                 def on_response(res):
-                    """响应监听：收集所有匹配的m3u8链接"""
-                    nonlocal m3u8_links
                     try:
-                        res_url = urllib.parse.unquote(res.url)
-                        # 正则：兼容所有m3u8格式（清晰度在任意位置、带参数、忽略大小写）
-                        if re.search(r"(0p|video|\d+p).*\.m3u8(\?.*)?$", res_url, re.IGNORECASE):
-                            # 去重添加（避免重复链接）
-                            if res_url not in m3u8_links:
-                                m3u8_links.append(res_url)
+                        if not res.ok:
+                            return
+
+                        # 获取原始、完整、带全部参数的真实 URL（不会丢失 token/key/sign）
+                        raw_url = res.url
+                        decoded_url = urllib.parse.unquote(raw_url)  # 解码确保完整
+
+                        if ".m3u8" in decoded_url:
+                            if decoded_url not in m3u8_list:
+                                m3u8_list.append(decoded_url)
                     except Exception:
-                        # 单个响应解析失败不影响整体，静默忽略
                         pass
 
-                # 绑定响应监听事件
                 page.on("response", on_response)
-                # 访问目标URL（超时时间转毫秒，等待网络空闲）
-                page.goto(url, timeout=Config.capture_timeout * 1000, wait_until="networkidle")
-                # 额外等待2秒，确保所有m3u8链接都被捕获
-                time.sleep(2)
 
-                # 核心：筛选最高清晰度的m3u8链接
-                m3u8_link = _get_highest_quality_url(m3u8_links)
+                # ===================== 打开页面（不卡死、不断连） =====================
+                try:
+                    page.goto(
+                        url,
+                        timeout=10 * 1000,
+                        wait_until="domcontentloaded"  # 绝对不用 networkidle
+                    )
+                except Exception:
+                    pass
 
-                # 资源清理
+                time.sleep(1)
+
+                # ===================== 真人模拟行为（确保视频加载完整） =====================
+                try:
+                    # 滑动到视频区域
+                    page.evaluate("window.scrollBy(0, 600)")
+                    time.sleep(1)
+
+                    # 点击视频触发播放（必须做，否则不加载完整 m3u8）
+                    page.locator("video").click(force=True)
+                    time.sleep(1)
+
+                    # 等待视频流完整输出
+                    time.sleep(4)
+
+                except Exception:
+                    time.sleep(3)
+
+                # 关闭
                 page.close()
                 context.close()
                 browser.close()
 
-                return m3u8_link
+            if not m3u8_list:
+                return None
+
+            # 返回最优链接：优先 video.m3u8，否则清晰度最大
+            best_link = max(m3u8_list, key=get_link_score)
+            return best_link
 
         except Exception as e:
             self.signals.log.emit(f"抓链异常：{title} | {str(e)}", "ERROR")
@@ -504,7 +507,7 @@ class DownloadWorker(QThread):
         # 跳过逻辑
         # 🔥 核心：自动提取视频编码做文件名
 
-        is_skip=False
+        is_skip = False
         # 跳过逻辑：检查文件是否真的存在且大小达标
         mp4_all_lst = [i for i in os.listdir(self.config.save_dir) if i.endswith(".mp4")]
         for file_name in mp4_all_lst:
@@ -519,23 +522,9 @@ class DownloadWorker(QThread):
                     with suppress(Exception):
                         os.remove(real_file_path)
                     break
-        # 优化后的CLI命令
-        cmd = [
-            self.config.cli_path,
-            m3u8_url,
-            "--saveName", save_path,
-            "--workDir", self.config.save_dir,
-            "--maxThreads", str(self.config.cli_threads),
-            "--retryCount", str(self.config.cli_retry),
-            "--enableDelAfterDone", "True",
-            "--enableMuxFastStart", "True",
-            "--headers", REQUEST_HEADERS,
-            "--noProxy","False"
-            "--timeOut", "30"
-        ]
 
         # yt-dlp工具
-        ffmpeg_path = r"D:\install_apps\ffmpeg.exe"
+        ffmpeg_path = r"C:\hjm\installApps\ffmpeg\bin\ffmpeg.exe"
 
         part_file = f"{save_path}.part"
 
@@ -544,17 +533,15 @@ class DownloadWorker(QThread):
             os.remove(part_file)
             print(f"✅ 清理残留文件：{part_file}")
 
-
-
         cmd = [
             "yt-dlp",
-            "--ffmpeg-location",ffmpeg_path,
+            "--ffmpeg-location", ffmpeg_path,
             "-o", save_path,
             "--user-agent", USER_AGENT,
             "--add-header", f"Referer:{REFERER}",
             "--hls-prefer-ffmpeg",
             "--hls-use-mpegts",
-            "--concurrent-fragments",  self.config.concurrent_fragments,
+            "--concurrent-fragments", self.config.concurrent_fragments,
             "--no-check-certificate",
             "--retries", "5",
             "--fragment-retries", "1",
@@ -589,17 +576,17 @@ class DownloadWorker(QThread):
 
             if os.path.exists(save_path):
                 self.signals.log.emit(f"CLI执行完成，文件已生成：{title}", "INFO")
-                return True, save_path,is_skip
+                return True, save_path, is_skip
             else:
                 self.signals.log.emit(f"CLI执行完成但文件未生成：{title}", "ERROR")
-                return False, save_path,is_skip
+                return False, save_path, is_skip
 
         except subprocess.TimeoutExpired:
             self.signals.log.emit(f"下载超时：{title}", "ERROR")
-            return False, save_path,is_skip
+            return False, save_path, is_skip
         except Exception as e:
             self.signals.log.emit(f"下载异常：{title} | {str(e)}", "ERROR")
-            return False, save_path,is_skip
+            return False, save_path, is_skip
 
     def stop(self):
         self.is_running = False
